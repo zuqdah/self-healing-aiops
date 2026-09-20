@@ -1,0 +1,217 @@
+name: Deploy
+
+# Manual only. Nothing in this repository spends money on a push.
+on:
+  workflow_dispatch:
+    inputs:
+      wait_for_real_alert:
+        description: "Also stage a fault and wait for the Azure alert to fire on its own (adds 5-15 minutes)."
+        type: boolean
+        default: false
+
+concurrency:
+  group: aiops-infra
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  images:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        app: [demo, responder]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: apps/${{ matrix.app }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/aiops-${{ matrix.app }}:${{ github.sha }}
+            ghcr.io/${{ github.repository_owner }}/aiops-${{ matrix.app }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  apply:
+    name: Terraform apply, publish agent, prove self-healing
+    needs: images
+    runs-on: ubuntu-latest
+    environment: lab
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Mask Azure identifiers
+        run: |
+          echo "::add-mask::$ARM_SUBSCRIPTION_ID"
+          echo "::add-mask::$ARM_TENANT_ID"
+          echo "::add-mask::$ARM_CLIENT_ID"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Terraform authenticates with OIDC directly; the Foundry SDK and the
+      # Azure CLI need a credential of their own.
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Init
+        working-directory: infra
+        run: >-
+          terraform init -input=false
+          -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}"
+          -backend-config="key=infra.tfstate"
+
+      - name: Apply
+        working-directory: infra
+        run: >-
+          terraform apply -input=false -auto-approve -lock-timeout=5m
+          -var="resource_group_name=${{ vars.LAB_RESOURCE_GROUP }}"
+          -var="restart_role_definition_id=${{ vars.RESTART_ROLE_DEFINITION_ID }}"
+          -var="demo_image=ghcr.io/${{ github.repository_owner }}/aiops-demo:${{ github.sha }}"
+          -var="responder_image=ghcr.io/${{ github.repository_owner }}/aiops-responder:${{ github.sha }}"
+
+      - name: Collect outputs
+        id: tf
+        working-directory: infra
+        run: |
+          {
+            echo "demo_url=$(terraform output -raw demo_url)"
+            echo "responder_url=$(terraform output -raw responder_url)"
+            echo "project_endpoint=$(terraform output -raw project_endpoint)"
+            echo "deployment_name=$(terraform output -raw deployment_name)"
+            echo "mcp_endpoint=$(terraform output -raw mcp_endpoint)"
+            echo "mcp_connection_name=$(terraform output -raw mcp_connection_name)"
+            echo "demo_app_name=$(terraform output -raw demo_app_name)"
+            echo "workbook_url=$(terraform output -raw workbook_url)"
+            echo "key_vault_name=$(terraform output -raw key_vault_name)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the workload and the responder
+        run: |
+          for url in "${{ steps.tf.outputs.demo_url }}" "${{ steps.tf.outputs.responder_url }}"; do
+            for _ in $(seq 1 30); do
+              if curl -fsS "$url/healthz" >/dev/null; then break; fi
+              sleep 10
+            done
+            curl -fsS "$url/healthz"
+          done
+
+      - name: Publish the diagnosing agent
+        working-directory: agents
+        env:
+          PROJECT_ENDPOINT: ${{ steps.tf.outputs.project_endpoint }}
+          MODEL_DEPLOYMENT: ${{ steps.tf.outputs.deployment_name }}
+          MCP_ENDPOINT: ${{ steps.tf.outputs.mcp_endpoint }}
+          MCP_CONNECTION_NAME: ${{ steps.tf.outputs.mcp_connection_name }}
+        run: |
+          pip install -r requirements.txt
+          python diagnostician.py
+
+      # Break the app for real, hand the responder the incident, and require
+      # that the workload is serving again at the end.
+      - name: Prove the loop heals a real fault
+        id: heal
+        env:
+          DEMO: ${{ steps.tf.outputs.demo_url }}
+          RESPONDER: ${{ steps.tf.outputs.responder_url }}
+        run: |
+          set -o pipefail
+          # Read the webhook token from Key Vault and mask it: this log is public.
+          token=$(az keyvault secret show --vault-name "${{ steps.tf.outputs.key_vault_name }}" --name alert-token --query value -o tsv)
+          echo "::add-mask::$token"
+
+          echo "Breaking the workload..."
+          curl -fsS -X POST "$DEMO/break" >/dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$DEMO/api/work")" = "500"
+          echo "Workload is failing as expected."
+
+          echo "Delivering the incident to the responder..."
+          incident=$(curl -fsS -X POST "$RESPONDER/alert/$token" \
+            -H 'content-type: application/json' \
+            -d "{\"target\": \"${{ steps.tf.outputs.demo_app_name }}\", \"alert\": \"5xx rate above threshold\"}")
+          echo "$incident"
+          id=$(echo "$incident" | jq -r .incident)
+
+          record=$(curl -fsS "$RESPONDER/incidents/$id")
+          echo "$record" | jq .
+          echo "$record" | jq -e '.status == "resolved"' >/dev/null
+          echo "$record" | jq -e '.healed == true' >/dev/null
+          echo "$record" | jq -e '.decision == "auto"' >/dev/null
+
+          echo "Confirming the workload serves traffic again..."
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$DEMO/api/work")" = "200"
+
+          {
+            echo "### Self-healing proved"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Diagnosis | $(echo "$record" | jq -r .diagnosis) |"
+            echo "| Tools used | $(echo "$record" | jq -r '.tools_used | join(", ")') |"
+            echo "| Decision | $(echo "$record" | jq -r '.decision') — $(echo "$record" | jq -r '.decision_reason') |"
+            echo "| Time to recovery | $(echo "$record" | jq -r .mttr_seconds)s |"
+            echo "| Diagnosis cost | \$$(echo "$record" | jq -r .cost_usd) |"
+            echo ""
+            echo "[Incidents, MTTR and cost dashboard](${{ steps.tf.outputs.workbook_url }})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The same fault, but left for Azure Monitor to notice on its own.
+      - name: Prove detection by the alert rule
+        if: inputs.wait_for_real_alert
+        env:
+          DEMO: ${{ steps.tf.outputs.demo_url }}
+          RESPONDER: ${{ steps.tf.outputs.responder_url }}
+        run: |
+          before=$(curl -fsS "$RESPONDER/incidents" | jq '.incidents | length')
+          curl -fsS -X POST "$DEMO/break" >/dev/null
+          # Keep failing requests flowing so the rule has something to count.
+          for _ in $(seq 1 60); do
+            curl -s -o /dev/null "$DEMO/api/work" || true
+            now=$(curl -fsS "$RESPONDER/incidents" | jq '.incidents | length')
+            if [ "$now" -gt "$before" ]; then
+              echo "The alert rule fired and the responder handled it."
+              curl -fsS "$RESPONDER/incidents" | jq '.incidents[-1]'
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::No incident arrived within 20 minutes of the fault."
+          exit 1
