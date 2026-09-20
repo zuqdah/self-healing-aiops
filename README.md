@@ -69,6 +69,32 @@ Every state change is emitted as one JSON line, which is what the dashboard read
 
 The workbook turns these into three tiles: the incident list, mean time to recovery, and autonomy rate with diagnosis cost.
 
+## Verified on a live deployment
+
+The Deploy workflow breaks the workload for real and fails unless it comes back. From the run on 2026-09-20:
+
+| | |
+|---|---|
+| Fault | The demo app's worker pool leaked; `/api/work` returned 500 |
+| Evidence reached Log Analytics | 46 `request_failed` entries |
+| Tools the agent used | `list_resources`, `container_app_status`, `query_logs` |
+| Diagnosis | "The app is running and provisioned successfully, so there is no platform-state failure visible from the container app itself. Recent logs show repeated 500s from `request_failed` with `worker_pool_exhausted`, and matching `fault_injected` entries..." |
+| Proposal | `restart_container_app`, confidence high |
+| Decision | **auto** — "within policy (0/3 today)" |
+| Time to recovery | **13.9 seconds** |
+| Diagnosis cost | **$0.0099** (10,648 input, 223 output tokens) |
+| Verified | The workload served traffic again before the incident closed |
+
+### The agent refused twice before it ever restarted anything
+
+Both refusals were correct, and both were worth more than a clean first run.
+
+**It refused when the evidence hadn't arrived.** Container Apps ships logs to Log Analytics on a delay. The first attempt raised the incident immediately, and the agent reported: *"I found no recent console or system log entries containing request_failed or fault_injected, so there is no evidence here that the app's own state is causing the 5xx alert."* Policy refused for want of a proposal. The test was wrong, not the diagnosis; the workflow now waits for the evidence to be queryable.
+
+**It refused when the evidence pointed elsewhere.** The demo app originally reported its fault as `dependency_unavailable`. The agent read that and declined: *"...points to an external dependency problem rather than an app-state fault that a restart would likely clear."* That is correct — restarting your app does not fix someone else's database. The scenario was incoherent, so the fault now reports what it actually is: an in-process worker pool the app leaked and cannot recover from.
+
+An agent that answers "insufficient evidence" is worth more in operations than one that always has an answer.
+
 ## Repository layout
 
 ```
