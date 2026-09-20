@@ -47,3 +47,8 @@ output "key_vault_name" {
   description = "Key Vault holding the lab's shared keys."
   value       = module.keyvault.name
 }
+
+output "workspace_guid" {
+  description = "Log Analytics workspace GUID, for querying via the data-plane API."
+  value       = module.observability.log_analytics_workspace_customer_id
+}

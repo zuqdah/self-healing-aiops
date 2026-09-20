@@ -122,6 +122,7 @@ jobs:
             echo "demo_app_name=$(terraform output -raw demo_app_name)"
             echo "workbook_url=$(terraform output -raw workbook_url)"
             echo "key_vault_name=$(terraform output -raw key_vault_name)"
+            echo "workspace_guid=$(terraform output -raw workspace_guid)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Wait for the workload and the responder
@@ -161,7 +162,31 @@ jobs:
           echo "Breaking the workload..."
           curl -fsS -X POST "$DEMO/break" >/dev/null
           test "$(curl -s -o /dev/null -w '%{http_code}' "$DEMO/api/work")" = "500"
+
+          # Generate enough failures to look like a real fault, not one blip.
+          for _ in $(seq 1 10); do curl -s -o /dev/null "$DEMO/api/work" || true; done
           echo "Workload is failing as expected."
+
+          # Container Apps ships console logs to Log Analytics on a delay of a
+          # minute or two. The agent diagnoses from those logs, so wait until
+          # the failures are actually queryable before raising the incident;
+          # otherwise it correctly reports that it found no evidence.
+          echo "Waiting for the failures to reach Log Analytics..."
+          query='{"query":"ContainerAppConsoleLogs_CL | where ContainerAppName_s == \"${{ steps.tf.outputs.demo_app_name }}\" | where Log_s has \"request_failed\" | summarize n = count()"}'
+          for attempt in $(seq 1 30); do
+            url="https://api.loganalytics.io/v1/workspaces/${{ steps.tf.outputs.workspace_guid }}/query"
+            n=$(az rest --method post --url "$url" --resource "https://api.loganalytics.io" \
+                  --body "$query" --query "tables[0].rows[0][0]" -o tsv 2>/dev/null || echo 0)
+            if [ "${n:-0}" -ge 3 ]; then
+              echo "Log Analytics has $n failure entries after $((attempt * 20))s."
+              break
+            fi
+            if [ "$attempt" = "30" ]; then
+              echo "::error::Failures never reached Log Analytics; the agent would have nothing to diagnose."
+              exit 1
+            fi
+            sleep 20
+          done
 
           echo "Delivering the incident to the responder..."
           incident=$(curl -fsS -X POST "$RESPONDER/alert/$token" \
