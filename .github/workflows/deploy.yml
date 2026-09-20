@@ -189,13 +189,9 @@ jobs:
           done
 
           echo "Delivering the incident to the responder..."
-          incident=$(curl -fsS -X POST "$RESPONDER/alert/$token" \
-            -H 'content-type: application/json' \
-            -d "{\"target\": \"${{ steps.tf.outputs.demo_app_name }}\", \"alert\": \"5xx rate above threshold\"}")
-          echo "$incident"
-          id=$(echo "$incident" | jq -r .incident)
-
-          record=$(curl -fsS "$RESPONDER/incidents/$id")
+          # The alert endpoint returns the finished incident record, so there
+          # is no second request that might land on a different replica.
+          record=$(curl -fsS -X POST "$RESPONDER/alert/$token" -H 'content-type: application/json' -d '{"target": "${{ steps.tf.outputs.demo_app_name }}", "alert": "5xx rate above threshold"}')
           echo "$record" | jq .
           echo "$record" | jq -e '.status == "resolved"' >/dev/null
           echo "$record" | jq -e '.healed == true' >/dev/null

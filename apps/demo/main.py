@@ -1,5 +1,10 @@
 """A small workload that can be broken on demand.
 
+The injected fault is an in-process one: the app leaks its worker pool and
+cannot recover by itself. That matters for the lab. The evidence in the logs
+has to point at a fault a restart actually fixes, otherwise a competent
+diagnosis will correctly refuse to restart it.
+
 The failure is deliberately in-memory, so restarting the app really does fix
 it. That makes "restart the revision" a genuine remediation rather than a
 simulated one.
@@ -56,9 +61,17 @@ def info() -> dict:
 def work():
     """The business endpoint the alert rule watches."""
     if state["broken"]:
-        emit("request_failed", status=500, reason="dependency_unavailable")
+        emit(
+            "request_failed",
+            status=500,
+            reason="worker_pool_exhausted",
+            detail="in-process worker pool is exhausted and will not recover on its own",
+        )
         return JSONResponse(
-            {"error": "dependency_unavailable", "detail": "cannot reach its data source"},
+            {
+                "error": "worker_pool_exhausted",
+                "detail": "this process has leaked all of its workers; it must be restarted",
+            },
             status_code=500,
         )
     emit("request_ok", status=200)
@@ -70,7 +83,7 @@ def break_it() -> dict:
     """Start failing. Used to stage an incident."""
     state["broken"] = True
     state["broken_since"] = time.time()
-    emit("fault_injected", reason="dependency_unavailable")
+    emit("fault_injected", reason="worker_pool_exhausted", scope="in_process_state")
     return {"broken": True}
 
 

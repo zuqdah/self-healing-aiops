@@ -64,7 +64,7 @@ def test_incident_runs_end_to_end_and_is_measured(client, monkeypatch):
 
     response = fire_alert(client)
     assert response.status_code == 200
-    incident = client.get(f"/incidents/{response.json()['incident']}").json()
+    incident = response.json()
 
     assert incident["status"] == "resolved"
     assert incident["decision"] == "auto"
@@ -80,7 +80,7 @@ def test_unhealed_incident_is_not_reported_as_resolved(client, monkeypatch):
     stub_agent(monkeypatch)
     stub_azure(monkeypatch, healed=False)
 
-    incident = client.get(f"/incidents/{fire_alert(client).json()['incident']}").json()
+    incident = fire_alert(client).json()
 
     assert incident["healed"] is False
     assert incident["status"] == "unresolved"
@@ -99,7 +99,7 @@ def test_repeated_incidents_escalate_instead_of_looping(client, monkeypatch):
         fire_alert(client)
     assert calls["restarts"] == 3
 
-    fourth = client.get(f"/incidents/{fire_alert(client).json()['incident']}").json()
+    fourth = fire_alert(client).json()
     assert fourth["status"] == "awaiting_approval"
     assert calls["restarts"] == 3, "the fourth restart must wait for a human"
 
@@ -108,7 +108,7 @@ def test_action_outside_policy_is_never_executed(client, monkeypatch):
     stub_agent(monkeypatch, action="delete_resource_group")
     calls = stub_azure(monkeypatch)
 
-    incident = client.get(f"/incidents/{fire_alert(client).json()['incident']}").json()
+    incident = fire_alert(client).json()
 
     assert incident["status"] == "refused"
     assert calls["restarts"] == 0
@@ -133,7 +133,7 @@ def test_human_can_approve_an_escalated_incident(client, monkeypatch):
     calls = stub_azure(monkeypatch)
     for _ in range(3):
         fire_alert(client)
-    escalated = fire_alert(client).json()["incident"]
+    escalated = fire_alert(client).json()["id"]
 
     approved = client.post(f"/incidents/{escalated}/approve", headers={"x-lab-key": "correct-key"})
 
@@ -148,7 +148,7 @@ def test_approval_requires_the_key(client, monkeypatch, headers):
     calls = stub_azure(monkeypatch)
     for _ in range(3):
         fire_alert(client)
-    escalated = fire_alert(client).json()["incident"]
+    escalated = fire_alert(client).json()["id"]
 
     assert client.post(f"/incidents/{escalated}/approve", headers=headers).status_code == 401
     assert calls["restarts"] == 3
@@ -157,7 +157,7 @@ def test_approval_requires_the_key(client, monkeypatch, headers):
 def test_an_already_resolved_incident_cannot_be_approved_again(client, monkeypatch):
     stub_agent(monkeypatch)
     stub_azure(monkeypatch)
-    resolved = fire_alert(client).json()["incident"]
+    resolved = fire_alert(client).json()["id"]
 
     again = client.post(f"/incidents/{resolved}/approve", headers={"x-lab-key": "correct-key"})
 
@@ -194,9 +194,7 @@ def test_azure_alert_payload_is_understood(client, monkeypatch):
         }
     }
 
-    response = client.post(f"/alert/{TOKEN}", json=payload)
-
-    incident = client.get(f"/incidents/{response.json()['incident']}").json()
+    incident = client.post(f"/alert/{TOKEN}", json=payload).json()
     assert incident["target"] == "ca-demo"
     assert incident["alert"] == "demo-5xx-rate"
 

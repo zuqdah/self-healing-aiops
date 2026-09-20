@@ -255,7 +255,9 @@ async def alert(path_token: str, body: Alert, request: Request) -> dict:
     incident.emit()
 
     handle(incident)
-    return {"incident": incident.id, "status": incident.status, "decision": incident.decision}
+    # The full record, so callers don't need a second request that could land
+    # on a different replica.
+    return asdict(incident)
 
 
 @app.post("/incidents/{incident_id}/approve")
@@ -272,7 +274,7 @@ def approve(incident_id: str, request: Request) -> dict:
     incident.decision_reason = "a person approved the escalated action"
     incident.emit()
     remediate_and_verify(incident)
-    return {"incident": incident.id, "status": incident.status, "healed": incident.healed}
+    return asdict(incident)
 
 
 @app.get("/incidents")

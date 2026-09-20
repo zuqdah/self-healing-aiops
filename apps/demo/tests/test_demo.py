@@ -24,7 +24,7 @@ def test_work_fails_once_broken(client):
     client.post("/break")
     response = client.get("/api/work")
     assert response.status_code == 500
-    assert response.json()["error"] == "dependency_unavailable"
+    assert response.json()["error"] == "worker_pool_exhausted"
 
 
 def test_health_stays_ok_while_broken(client):
