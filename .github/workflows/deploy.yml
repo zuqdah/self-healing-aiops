@@ -191,7 +191,14 @@ jobs:
           echo "Delivering the incident to the responder..."
           # The alert endpoint returns the finished incident record, so there
           # is no second request that might land on a different replica.
-          record=$(curl -fsS -X POST "$RESPONDER/alert/$token" -H 'content-type: application/json' -d '{"target": "${{ steps.tf.outputs.demo_app_name }}", "alert": "5xx rate above threshold"}')
+          # A revision switch can leave the single replica briefly
+          # unavailable, so give the ingress a few chances.
+          for attempt in 1 2 3 4 5; do
+            record=$(curl -fsS -X POST "$RESPONDER/alert/$token" -H 'content-type: application/json' -d '{"target": "${{ steps.tf.outputs.demo_app_name }}", "alert": "5xx rate above threshold"}') && break
+            echo "attempt $attempt could not reach the responder; retrying"
+            sleep 15
+          done
+          test -n "$record"
           echo "$record" | jq .
           echo "$record" | jq -e '.status == "resolved"' >/dev/null
           echo "$record" | jq -e '.healed == true' >/dev/null
